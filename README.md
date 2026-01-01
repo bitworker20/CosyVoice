@@ -199,6 +199,47 @@ docker run -d --runtime=nvidia -p 50000:50000 cosyvoice:v1.0 /bin/bash -c "cd /o
 cd fastapi && python3 client.py --port 50000 --mode <sft|zero_shot|cross_lingual|instruct>
 ```
 
+#### ROCm Docker (AMD GPU, ROCm 7.1.1+)
+
+We provide a ROCm-oriented Docker setup that starts the **FastAPI** server and supports **model auto-download to a mounted volume**.
+
+- Build image:
+
+```sh
+chmod +x docker/build_rocm_image.sh
+docker/build_rocm_image.sh
+# or override base image / tag
+# docker/build_rocm_image.sh --tag cosyvoice:rocm --base-image rocm/pytorch:rocm7.1.1_ubuntu22.04_py3.10_pytorch_release_2.9.1
+```
+
+- Run (ROCm device mapping):
+
+```sh
+mkdir -p ./models
+docker run --rm -it \
+  --device=/dev/kfd --device=/dev/dri --group-add video \
+  --ipc=host --shm-size=8g \
+  -p 50000:50000 \
+  -v "$PWD/models:/models" \
+  -e MODEL_ID="FunAudioLLM/Fun-CosyVoice3-0.5B-2512" \
+  -e MODEL_DIR="/models/Fun-CosyVoice3-0.5B-2512" \
+  cosyvoice:rocm7.1.1
+```
+
+The container entrypoint will:
+- Use the mounted `MODEL_DIR` if it already contains `cosyvoice*.yaml`
+- Otherwise download `MODEL_ID` from **HuggingFace** into `MODEL_DIR`
+
+Environment variables:
+- `MODEL_ID`: HuggingFace repo id (default: `FunAudioLLM/Fun-CosyVoice3-0.5B-2512`)
+- `MODEL_ROOT`: mounted models root (default: `/models`)
+- `MODEL_DIR`: local model path inside container (default: `/models/Fun-CosyVoice3-0.5B-2512`)
+- `PORT`: FastAPI port (default: `50000`)
+- `HF_TOKEN` / `HUGGINGFACE_HUB_TOKEN`: optional token for gated/limited models
+
+Notes:
+- On AMD ROCm, `torch.cuda.is_available()` is `True`; we added a safe ONNXRuntime provider selection so ONNX frontend models will use `ROCMExecutionProvider` when available, otherwise fall back to CPU.
+
 #### Using Nvidia TensorRT-LLM for deployment
 
 Using TensorRT-LLM to accelerate cosyvoice2 llm could give 4x acceleration comparing with huggingface transformers implementation.

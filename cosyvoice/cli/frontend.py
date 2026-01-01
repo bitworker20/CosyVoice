@@ -17,14 +17,47 @@ import json
 import onnxruntime
 import torch
 import numpy as np
-import whisper
 from typing import Callable
+import torchaudio
 import torchaudio.compliance.kaldi as kaldi
 import os
 import re
 import inflect
 from cosyvoice.utils.file_utils import logging, load_wav
 from cosyvoice.utils.frontend_utils import contains_chinese, replace_blank, replace_corner_mark, remove_bracket, spell_out_number, split_paragraph, is_only_punctuation
+
+
+def _log_mel_spectrogram_16k(audio: torch.Tensor, n_mels: int = 128) -> torch.Tensor:
+    """
+    Replacement for `whisper.log_mel_spectrogram` to avoid the `openai-whisper -> triton<3` dependency
+    conflict on ROCm PyTorch (which ships with triton>=3).
+
+    Returns a tensor shaped (1, n_mels, frames) to match the ONNX speech tokenizer input expectation.
+    """
+    # audio: (1, T) or (T,)
+    if audio.dim() == 2:
+        audio = audio.squeeze(0)
+    assert audio.dim() == 1, f"expected 1D audio, got {tuple(audio.shape)}"
+
+    # Whisper-like parameters
+    sample_rate = 16000
+    n_fft = 400
+    hop_length = 160
+    win_length = 400
+
+    mel = torchaudio.transforms.MelSpectrogram(
+        sample_rate=sample_rate,
+        n_fft=n_fft,
+        win_length=win_length,
+        hop_length=hop_length,
+        n_mels=n_mels,
+        center=True,
+        power=2.0,
+        norm=None,
+        mel_scale="slaney",
+    )(audio)
+    mel = torch.clamp(mel, min=1e-10).log10()
+    return mel.unsqueeze(0)
 
 
 class CosyVoiceFrontEnd:
@@ -43,9 +76,24 @@ class CosyVoiceFrontEnd:
         option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         option.intra_op_num_threads = 1
         self.campplus_session = onnxruntime.InferenceSession(campplus_model, sess_options=option, providers=["CPUExecutionProvider"])
-        self.speech_tokenizer_session = onnxruntime.InferenceSession(speech_tokenizer_model, sess_options=option,
-                                                                     providers=["CUDAExecutionProvider" if torch.cuda.is_available() else
-                                                                                "CPUExecutionProvider"])
+        # NOTE:
+        # - On AMD ROCm, PyTorch reports `torch.cuda.is_available() == True`, but ONNXRuntime may NOT have CUDA EP.
+        # - Prefer ROCm EP when available; otherwise fall back to CPU to keep inference functional.
+        available_eps = set(onnxruntime.get_available_providers())
+        if torch.cuda.is_available():
+            if "ROCMExecutionProvider" in available_eps:
+                speech_tokenizer_provider = "ROCMExecutionProvider"
+            elif "CUDAExecutionProvider" in available_eps:
+                speech_tokenizer_provider = "CUDAExecutionProvider"
+            else:
+                speech_tokenizer_provider = "CPUExecutionProvider"
+        else:
+            speech_tokenizer_provider = "CPUExecutionProvider"
+        self.speech_tokenizer_session = onnxruntime.InferenceSession(
+            speech_tokenizer_model,
+            sess_options=option,
+            providers=[speech_tokenizer_provider],
+        )
         if os.path.exists(spk2info):
             self.spk2info = torch.load(spk2info, map_location=self.device, weights_only=True)
         else:
@@ -95,7 +143,7 @@ class CosyVoiceFrontEnd:
     def _extract_speech_token(self, prompt_wav):
         speech = load_wav(prompt_wav, 16000)
         assert speech.shape[1] / 16000 <= 30, 'do not support extract speech token for audio longer than 30s'
-        feat = whisper.log_mel_spectrogram(speech, n_mels=128)
+        feat = _log_mel_spectrogram_16k(speech, n_mels=128)
         speech_token = self.speech_tokenizer_session.run(None,
                                                          {self.speech_tokenizer_session.get_inputs()[0].name:
                                                           feat.detach().cpu().numpy(),
